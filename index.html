@@ -7,25 +7,1060 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
       body { margin: 0; overflow: hidden; background-color: #000510; }
-      /* Custom scrollbar for wish list */
       ::-webkit-scrollbar { width: 6px; }
       ::-webkit-scrollbar-track { background: transparent; }
       ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 3px; }
     </style>
-  <script type="importmap">
-{
-  "imports": {
-    "react": "https://esm.sh/react@^19.2.3",
-    "react-dom/": "https://esm.sh/react-dom@^19.2.3/",
-    "react/": "https://esm.sh/react@^19.2.3/",
-    "three": "https://esm.sh/three@^0.182.0",
-    "@mediapipe/tasks-vision": "https://esm.sh/@mediapipe/tasks-vision@^0.10.22-rc.20250304",
-    "three/": "https://esm.sh/three@^0.182.0/"
-  }
-}
-</script>
-</head>
+    
+    <!-- Import Map -->
+    <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@18.2.0",
+        "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+        "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/+esm"
+      }
+    }
+    </script>
+    
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  </head>
   <body>
     <div id="root"></div>
+
+    <script type="text/babel" data-type="module">
+      import React, { useState, useRef, useEffect, useCallback } from 'react';
+      import ReactDOM from 'react-dom/client';
+      import * as THREE from 'three';
+      import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+      import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+      import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+      import { FilesetResolver, HandLandmarker, DrawingUtils } from "@mediapipe/tasks-vision";
+
+      // --- Constants & Types ---
+      const AppMode = {
+        TREE: 'TREE',
+        SCATTER: 'SCATTER',
+        FOCUS: 'FOCUS',
+      };
+
+      const COLORS = {
+        RED: 0xD42426,
+        GREEN: 0x165B33,
+        DARK_RED: 0x8B0000,
+        DARK_GREEN: 0x0B301A,
+        GOLD: 0xFFD700,
+        WHITE: 0xFFFFFF,
+        BLUE: 0x87CEEB,
+      };
+
+      const PARTICLE_COUNT = 1500;
+      const SNOW_COUNT = 300;
+      const MP_VISION_PATH = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm";
+
+      const GEOMETRIES = {
+        SPHERE: new THREE.SphereGeometry(0.5, 8, 8),
+        BOX: new THREE.BoxGeometry(0.7, 0.7, 0.7),
+        STAR: new THREE.OctahedronGeometry(1.0, 0),
+      };
+
+      // --- Services: VisionService ---
+      class VisionService {
+        constructor() {
+          this.handLandmarker = null;
+          this.canvasCtx = null;
+          this.drawingUtils = null;
+          this.lastVideoTime = -1;
+        }
+
+        async initialize() {
+          try {
+            const vision = await FilesetResolver.forVisionTasks(MP_VISION_PATH);
+            this.handLandmarker = await HandLandmarker.createFromOptions(vision, {
+              baseOptions: {
+                modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                delegate: "GPU"
+              },
+              runningMode: "VIDEO",
+              numHands: 1
+            });
+            return true;
+          } catch (error) {
+            console.error("Failed to init HandLandmarker", error);
+            return false;
+          }
+        }
+
+        setupCanvas(canvas) {
+          this.canvasCtx = canvas.getContext("2d");
+          if (this.canvasCtx) {
+            this.drawingUtils = new DrawingUtils(this.canvasCtx);
+          }
+        }
+
+        detect(video, canvas) {
+          if (!this.handLandmarker || !this.canvasCtx || !this.drawingUtils) {
+              return { name: 'NONE', pinchDistance: 1, position: {x: 0.5, y: 0.5} };
+          }
+
+          if (video.currentTime !== this.lastVideoTime) {
+            this.lastVideoTime = video.currentTime;
+            const results = this.handLandmarker.detectForVideo(video, performance.now());
+
+            this.canvasCtx.save();
+            this.canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            if (results.landmarks && results.landmarks.length > 0) {
+              const landmarks = results.landmarks[0];
+              
+              this.canvasCtx.translate(canvas.width, 0);
+              this.canvasCtx.scale(-1, 1);
+              
+              this.drawingUtils.drawConnectors(landmarks, HandLandmarker.HAND_CONNECTIONS, {
+                color: "#FF0000",
+                lineWidth: 2
+              });
+              this.drawingUtils.drawLandmarks(landmarks, {
+                color: "#FFD700",
+                lineWidth: 1,
+                radius: 3
+              });
+
+              this.canvasCtx.restore();
+              return this.interpretGesture(landmarks);
+            }
+          }
+          
+          return { name: 'NONE', pinchDistance: 1, position: {x: 0.5, y: 0.5} };
+        }
+
+        interpretGesture(landmarks) {
+          const thumbTip = landmarks[4];
+          const indexTip = landmarks[8];
+          const middleTip = landmarks[12];
+          const ringTip = landmarks[16];
+          const pinkyTip = landmarks[20];
+          const wrist = landmarks[0];
+          const middleMCP = landmarks[9];
+
+          const position = { x: middleMCP.x, y: middleMCP.y };
+
+          const dist = (p1, p2) => Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2) + Math.pow(p1.z - p2.z, 2));
+
+          const pinchDist = dist(thumbTip, indexTip);
+          const avgTipDistToWrist = (dist(indexTip, wrist) + dist(middleTip, wrist) + dist(ringTip, wrist) + dist(pinkyTip, wrist)) / 4;
+          
+          const PINCH_THRESHOLD = 0.05;
+
+          if (pinchDist < PINCH_THRESHOLD) {
+            return { name: 'PINCH', pinchDistance: pinchDist, position };
+          } else if (avgTipDistToWrist < 0.25) { 
+             return { name: 'FIST', pinchDistance: pinchDist, position };
+          } else {
+            return { name: 'OPEN', pinchDistance: pinchDist, position };
+          }
+        }
+      }
+
+      const visionService = new VisionService();
+
+      // --- Component: Scene ---
+      const createStripedTexture = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = 128;
+        canvas.height = 128;
+        const ctx = canvas.getContext('2d');
+        if(ctx) {
+            ctx.fillStyle = '#E0E0E0'; 
+            ctx.fillRect(0,0,128,128);
+            ctx.fillStyle = '#C02020'; 
+            ctx.beginPath();
+            const step = 32;
+            for(let i = -128; i < 256; i += step * 2) {
+                ctx.moveTo(i, 0);
+                ctx.lineTo(i + step, 0);
+                ctx.lineTo(i + step - 128, 128);
+                ctx.lineTo(i - 128, 128);
+                ctx.closePath();
+            }
+            ctx.fill();
+        }
+        const tex = new THREE.CanvasTexture(canvas);
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.RepeatWrapping;
+        tex.repeat.set(1, 1);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.minFilter = THREE.LinearFilter;
+        tex.magFilter = THREE.LinearFilter; 
+        return tex;
+      };
+
+      const Scene = ({ mode, gesture, wishes, setMode, onFocusItem, config }) => {
+        const containerRef = useRef(null);
+        const rendererRef = useRef(null);
+        const sceneRef = useRef(null);
+        const cameraRef = useRef(null);
+        const composerRef = useRef(null);
+        const bloomPassRef = useRef(null);
+        
+        const particlesRef = useRef([]);
+        const mainGroupRef = useRef(new THREE.Group());
+        const snowGroupRef = useRef(new THREE.Group());
+        const timeRef = useRef(0);
+        const modeRef = useRef(mode);
+        const gestureRef = useRef(gesture);
+        const wishesRef = useRef(wishes);
+        const configRef = useRef(config);
+        
+        const focusedItemRef = useRef(null);
+        const activeWishIdRef = useRef(null);
+        
+        const materialsCacheRef = useRef({});
+        const stripedTextureRef = useRef(null);
+
+        useEffect(() => { modeRef.current = mode; }, [mode]);
+        useEffect(() => { gestureRef.current = gesture; }, [gesture]);
+        useEffect(() => { configRef.current = config; }, [config]);
+
+        useEffect(() => {
+           Object.values(materialsCacheRef.current).forEach(mat => {
+               if (mat instanceof THREE.MeshStandardMaterial) {
+                   mat.emissiveIntensity = config.particleGlow;
+                   mat.needsUpdate = true;
+               }
+           });
+        }, [config.particleGlow]);
+
+        useEffect(() => {
+           if (sceneRef.current) initParticles();
+        }, [config.particleCount, config.baseSize, config.treeGapFactor]); 
+        
+        useEffect(() => {
+          if (wishes.length === 0) {
+              activeWishIdRef.current = null;
+              focusedItemRef.current = null;
+              return;
+          }
+
+          if (mode === AppMode.FOCUS) {
+              const randomWish = wishes[Math.floor(Math.random() * wishes.length)];
+              activeWishIdRef.current = randomWish.id;
+              focusedItemRef.current = randomWish;
+
+              if (randomWish.type === 'VIDEO' && randomWish.texture) {
+                  const vidTex = randomWish.texture;
+                  if (vidTex.image instanceof HTMLVideoElement) {
+                      vidTex.image.currentTime = 0;
+                      vidTex.image.play().catch(e => console.log("Auto-play blocked"));
+                  }
+              }
+          } else {
+              wishes.forEach(w => {
+                  if (w.type === 'VIDEO' && w.texture) {
+                       const vidTex = w.texture;
+                       if (vidTex.image instanceof HTMLVideoElement) {
+                           vidTex.image.pause();
+                       }
+                  }
+              });
+              focusedItemRef.current = null;
+          }
+        }, [mode, wishes]);
+
+        useEffect(() => {
+          if (sceneRef.current && wishes.length > 0) {
+              wishesRef.current = wishes;
+              initParticles();
+          }
+        }, [wishes]);
+
+        const getCachedMaterial = (color) => {
+            if (!materialsCacheRef.current[color]) {
+                const isGreen = color === COLORS.GREEN || color === COLORS.DARK_GREEN;
+                materialsCacheRef.current[color] = new THREE.MeshStandardMaterial({ 
+                    color: color, 
+                    roughness: isGreen ? 0.2 : 0.4, 
+                    metalness: isGreen ? 0.6 : 0.5, 
+                    emissive: color, 
+                    emissiveIntensity: configRef.current ? configRef.current.particleGlow : 1.0 
+                });
+            }
+            return materialsCacheRef.current[color];
+        };
+
+        const initParticles = () => {
+          if (!mainGroupRef.current) return;
+          
+          if (!stripedTextureRef.current) {
+              stripedTextureRef.current = createStripedTexture();
+          }
+          
+          while(mainGroupRef.current.children.length > 0){ 
+              const obj = mainGroupRef.current.children[0];
+              if(obj.geometry) obj.geometry.dispose();
+              mainGroupRef.current.remove(obj);
+          }
+          particlesRef.current = [];
+
+          // 1. Wish Particles
+          wishesRef.current.forEach((wish) => {
+              let mesh;
+              
+              const frameMat = new THREE.MeshStandardMaterial({ 
+                  map: stripedTextureRef.current,
+                  color: 0xcccccc, 
+                  roughness: 0.8, 
+                  metalness: 0.1,
+                  emissive: 0x000000,
+                  emissiveIntensity: 0
+              });
+
+              const contentMat = new THREE.MeshBasicMaterial({ 
+                  map: wish.texture, 
+                  side: THREE.DoubleSide,
+                  color: 0xcccccc, 
+              });
+
+              if (wish.type === 'TEXT') contentMat.transparent = true;
+
+              if (wish.type === 'PHOTO' || wish.type === 'VIDEO') {
+                  const frameGeo = new THREE.BoxGeometry(1.1 * wish.aspectRatio, 1.1, 0.05);
+                  const frame = new THREE.Mesh(frameGeo, frameMat);
+                  
+                  const planeGeo = new THREE.PlaneGeometry(wish.aspectRatio, 1);
+                  const content = new THREE.Mesh(planeGeo, contentMat);
+                  content.position.z = 0.03;
+                  
+                  frame.add(content);
+                  mesh = frame;
+              } else {
+                  const frameGeo = new THREE.BoxGeometry(1.6 * wish.aspectRatio, 1.6, 0.05);
+                  const frame = new THREE.Mesh(frameGeo, frameMat);
+
+                  const planeGeo = new THREE.PlaneGeometry(wish.aspectRatio * 1.5, 1.5);
+                  const content = new THREE.Mesh(planeGeo, contentMat);
+                  content.position.z = 0.03;
+                  frame.add(content);
+                  mesh = frame;
+              }
+              
+              mainGroupRef.current.add(mesh);
+              particlesRef.current.push({
+                  mesh: mesh,
+                  velocity: new THREE.Vector3(),
+                  basePosition: new THREE.Vector3(),
+                  randomOffset: new THREE.Vector3((Math.random()-0.5), (Math.random()-0.5), (Math.random()-0.5)),
+                  phase: Math.random() * Math.PI * 2,
+                  isWishItem: true,
+                  wishId: wish.id,
+                  originalScale: 1
+              });
+          });
+
+          // 2. Standard Particles
+          const getColor = () => {
+              const r = Math.random();
+              if (r < 0.3) return COLORS.RED;
+              if (r < 0.6) return COLORS.GREEN;
+              if (r < 0.7) return COLORS.DARK_RED;
+              if (r < 0.8) return COLORS.DARK_GREEN;
+              if (r < 0.9) return COLORS.GOLD;
+              if (r < 0.95) return COLORS.WHITE;
+              return COLORS.BLUE;
+          };
+
+          const count = configRef.current.particleCount;
+          const baseSizeConfig = configRef.current.baseSize;
+          const gapFactor = configRef.current.treeGapFactor;
+
+          for (let i = 0; i < count; i++) {
+              const type = Math.random();
+              let geo = GEOMETRIES.SPHERE;
+              if (type > 0.95) { geo = GEOMETRIES.STAR; }
+              else if (type > 0.8) { geo = GEOMETRIES.BOX; }
+
+              const color = getColor();
+              const mat = getCachedMaterial(color);
+              const mesh = new THREE.Mesh(geo, mat);
+              
+              mesh.position.set((Math.random()-0.5)*50, (Math.random()-0.5)*50, (Math.random()-0.5)*50);
+              
+              const heightFactor = 1 - (i / count); 
+              const baseSize = (Math.random() * 0.2 + 0.15) * baseSizeConfig;
+              const randomBonus = 0.5 + Math.random() * 1.0; 
+              const sizeBonus = Math.pow(heightFactor, gapFactor) * randomBonus; 
+              const finalScale = baseSize + sizeBonus;
+
+              mesh.scale.setScalar(finalScale);
+              
+              mainGroupRef.current.add(mesh);
+              
+              particlesRef.current.push({
+                  mesh: mesh,
+                  velocity: new THREE.Vector3(),
+                  basePosition: new THREE.Vector3(),
+                  randomOffset: new THREE.Vector3((Math.random()-0.5), (Math.random()-0.5), (Math.random()-0.5)),
+                  phase: Math.random() * Math.PI * 2,
+                  isWishItem: false,
+                  originalScale: finalScale
+              });
+          }
+
+          // 3. Top Star
+          const topStarGeo = new THREE.OctahedronGeometry(0.8, 0); 
+          const topStarMat = new THREE.MeshStandardMaterial({ 
+              color: COLORS.GOLD, 
+              emissive: COLORS.GOLD, 
+              emissiveIntensity: 1.0, 
+              metalness: 1.0, 
+              roughness: 0.2
+          });
+          const topStar = new THREE.Mesh(topStarGeo, topStarMat);
+          mainGroupRef.current.add(topStar);
+          particlesRef.current.push({
+              mesh: topStar,
+              velocity: new THREE.Vector3(),
+              basePosition: new THREE.Vector3(0, 14, 0),
+              randomOffset: new THREE.Vector3(),
+              phase: 0,
+              isWishItem: false,
+              originalScale: 1.5
+          });
+        };
+
+        const createSnow = () => {
+          const geometry = new THREE.BufferGeometry();
+          const vertices = [];
+          for (let i = 0; i < SNOW_COUNT; i++) {
+              vertices.push(
+                  (Math.random() - 0.5) * 60,
+                  Math.random() * 40 - 10,
+                  (Math.random() - 0.5) * 60
+              );
+          }
+          geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+          const material = new THREE.PointsMaterial({
+              color: 0xffffff,
+              size: 0.2,
+              transparent: true,
+              opacity: 0.6
+          });
+          const snow = new THREE.Points(geometry, material);
+          snowGroupRef.current.add(snow);
+        };
+
+        useEffect(() => {
+          if (!containerRef.current) return;
+
+          const scene = new THREE.Scene();
+          scene.fog = new THREE.FogExp2(0x000510, 0.02);
+          sceneRef.current = scene;
+
+          const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+          camera.position.set(0, 0, 35);
+          cameraRef.current = camera;
+
+          const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+          renderer.setSize(window.innerWidth, window.innerHeight);
+          renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+          renderer.toneMapping = THREE.ACESFilmicToneMapping; 
+          renderer.toneMappingExposure = 0.9; 
+          
+          containerRef.current.appendChild(renderer.domElement);
+          rendererRef.current = renderer;
+
+          const renderScene = new RenderPass(scene, camera);
+          const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+          bloomPass.threshold = 0.85; 
+          bloomPass.strength = 1.2; 
+          bloomPass.radius = 0.5;
+          bloomPassRef.current = bloomPass;
+
+          const composer = new EffectComposer(renderer);
+          composer.addPass(renderScene);
+          composer.addPass(bloomPass);
+          composerRef.current = composer;
+
+          const ambientLight = new THREE.AmbientLight(0xffffff, 0.4); 
+          scene.add(ambientLight);
+          
+          const frontLight = new THREE.DirectionalLight(0xffffff, 0.8);
+          frontLight.position.set(0, 0, 50);
+          scene.add(frontLight);
+
+          const pointLight = new THREE.PointLight(0xffd700, 2.5, 100);
+          pointLight.position.set(10, 20, 20);
+          scene.add(pointLight);
+          
+          const pointLight2 = new THREE.PointLight(0x87CEEB, 1.5, 100);
+          pointLight2.position.set(-15, -10, 10);
+          scene.add(pointLight2);
+          
+          const backLight = new THREE.DirectionalLight(0xff0000, 0.8);
+          backLight.position.set(0, 5, -10);
+          scene.add(backLight);
+
+          scene.add(mainGroupRef.current);
+          scene.add(snowGroupRef.current);
+
+          initParticles();
+          createSnow();
+
+          let animationFrameId;
+
+          const animate = () => {
+            animationFrameId = requestAnimationFrame(animate);
+            timeRef.current += 0.01;
+            const currentMode = modeRef.current;
+            const currentGesture = gestureRef.current;
+            const time = timeRef.current;
+            const currentConfig = configRef.current;
+            const activeWishId = activeWishIdRef.current;
+
+            const targetCamPos = (currentMode === AppMode.FOCUS) 
+              ? new THREE.Vector3(0, 0, 7) 
+              : new THREE.Vector3(0, 0, 35);
+            
+            const lerpFactor = currentMode === AppMode.FOCUS ? 0.1 : 0.05;
+            camera.position.lerp(targetCamPos, lerpFactor);
+            camera.lookAt(0, 0, 0);
+
+            if (bloomPassRef.current) {
+               const targetStrength = currentMode === AppMode.FOCUS ? 0.2 : currentConfig.bloomStrength;
+               bloomPassRef.current.strength = THREE.MathUtils.lerp(bloomPassRef.current.strength, targetStrength, 0.1);
+            }
+
+            if (currentMode === AppMode.SCATTER && currentGesture.name !== 'NONE') {
+                const targetRotY = (currentGesture.position.x - 0.5) * Math.PI * 2;
+                const targetRotX = (currentGesture.position.y - 0.5) * Math.PI;
+                mainGroupRef.current.rotation.y = THREE.MathUtils.lerp(mainGroupRef.current.rotation.y, targetRotY, 0.1);
+                mainGroupRef.current.rotation.x = THREE.MathUtils.lerp(mainGroupRef.current.rotation.x, targetRotX, 0.1);
+            } else if (currentMode === AppMode.TREE) {
+                mainGroupRef.current.rotation.y += 0.003;
+                mainGroupRef.current.rotation.x = THREE.MathUtils.lerp(mainGroupRef.current.rotation.x, 0, 0.05);
+            } else if (currentMode === AppMode.SCATTER) {
+                mainGroupRef.current.rotation.y += 0.0005;
+            } else if (currentMode === AppMode.FOCUS) {
+                mainGroupRef.current.rotation.y = THREE.MathUtils.lerp(mainGroupRef.current.rotation.y, 0, 0.05);
+                mainGroupRef.current.rotation.x = THREE.MathUtils.lerp(mainGroupRef.current.rotation.x, 0, 0.05);
+            }
+
+            let i = 0;
+            const targetVec = new THREE.Vector3();
+            const count = particlesRef.current.length;
+
+            for (const p of particlesRef.current) {
+              if (p.isWishItem) {
+                  if (currentMode === AppMode.FOCUS) {
+                      const isVisible = (p.wishId === activeWishId);
+                      p.mesh.visible = isVisible;
+                  } else {
+                      p.mesh.visible = true;
+                  }
+              }
+
+              if (currentMode === AppMode.TREE) {
+                  const h = (i / count) * 25 - 12.5; 
+                  const radius = (12.5 - h) * 0.4; 
+                  const angle = i * 0.5 + time * 0.1;
+                  
+                  if (i === count - 1) {
+                      targetVec.set(0, 13, 0); 
+                  } else {
+                     targetVec.set(Math.cos(angle) * radius, h, Math.sin(angle) * radius);
+                  }
+              } else if (currentMode === AppMode.SCATTER) {
+                  const noise = Math.sin(i * 0.5) + Math.cos(i * 0.3);
+                  const baseR = 12 + Math.abs(noise) * currentConfig.scatterRadius; 
+                  const theta = i * 0.05 + time * 0.02; 
+                  const phi = Math.acos( -1 + ( 2 * i ) / count ) + Math.sin(time * 0.2 + i) * 0.5;
+                  targetVec.setFromSphericalCoords(baseR, theta, phi);
+              } else if (currentMode === AppMode.FOCUS) {
+                   if (p.isWishItem && p.wishId === activeWishId) {
+                       targetVec.set(0, 0, 0); 
+                       p.mesh.rotation.set(0,0,0);
+                   } else {
+                       const r = 40 + Math.sin(i)*10; 
+                       const theta = i * 132.5;
+                       const phi = i * 0.1;
+                       targetVec.setFromSphericalCoords(r, theta, phi);
+                   }
+              }
+
+              p.mesh.position.lerp(targetVec, 0.06);
+              
+              let targetScale = p.originalScale;
+              const breathe = Math.sin(time * 3 + p.phase) * 0.15 + 1.0;
+              const metallicFlicker = Math.sin(time * 10 + p.phase * 10) * 0.1; 
+              
+              if (currentMode === AppMode.FOCUS && p.isWishItem && p.wishId === activeWishId) {
+                  targetScale = 2.5; 
+                  p.mesh.scale.setScalar(THREE.MathUtils.lerp(p.mesh.scale.x, targetScale, 0.15));
+              } else {
+                  targetScale = p.originalScale * (breathe + metallicFlicker);
+                  p.mesh.scale.setScalar(targetScale);
+
+                  p.mesh.rotation.x += 0.02;
+                  p.mesh.rotation.y += 0.01;
+              }
+
+              if (currentMode !== AppMode.FOCUS || !p.isWishItem) {
+                  p.mesh.position.y += Math.sin(time * 2 + p.phase) * 0.02;
+              }
+
+              i++;
+            }
+
+            const positions = snowGroupRef.current.children[0].geometry.attributes.position.array;
+            for (let j = 1; j < positions.length; j += 3) {
+                positions[j] -= 0.15;
+                if (positions[j] < -25) positions[j] = 25;
+            }
+            snowGroupRef.current.children[0].geometry.attributes.position.needsUpdate = true;
+
+            composer.render();
+          };
+
+          animate();
+
+          const handleResize = () => {
+              camera.aspect = window.innerWidth / window.innerHeight;
+              camera.updateProjectionMatrix();
+              renderer.setSize(window.innerWidth, window.innerHeight);
+              composer.setSize(window.innerWidth, window.innerHeight);
+          };
+          window.addEventListener('resize', handleResize);
+
+          return () => {
+            window.removeEventListener('resize', handleResize);
+            cancelAnimationFrame(animationFrameId);
+            if (rendererRef.current) {
+                rendererRef.current.dispose();
+                containerRef.current?.removeChild(rendererRef.current.domElement);
+            }
+          };
+        }, []); 
+
+        return <div ref={containerRef} className="absolute inset-0 z-0" />;
+      };
+
+      // --- Component: WebcamInput ---
+      const WebcamInput = ({ onGesture, onLoaded }) => {
+        const videoRef = useRef(null);
+        const canvasRef = useRef(null);
+        const requestRef = useRef(0);
+        const [isCollapsed, setIsCollapsed] = useState(false);
+
+        useEffect(() => {
+          const init = async () => {
+            const success = await visionService.initialize();
+            if (!success) return;
+
+            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+              try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                  video: { width: 320, height: 240, frameRate: 30 } 
+                });
+                
+                if (videoRef.current) {
+                  videoRef.current.srcObject = stream;
+                  videoRef.current.onloadeddata = () => {
+                    if (canvasRef.current) {
+                        visionService.setupCanvas(canvasRef.current);
+                    }
+                    onLoaded();
+                    detectLoop();
+                  };
+                }
+              } catch (err) {
+                console.error("Webcam access denied", err);
+              }
+            }
+          };
+
+          init();
+
+          return () => {
+            if (requestRef.current) cancelAnimationFrame(requestRef.current);
+            if (videoRef.current && videoRef.current.srcObject) {
+               videoRef.current.srcObject.getTracks().forEach(track => track.stop());
+            }
+          };
+        }, []);
+
+        const detectLoop = () => {
+          if (videoRef.current && canvasRef.current) {
+             const gesture = visionService.detect(videoRef.current, canvasRef.current);
+             onGesture(gesture);
+          }
+          requestRef.current = requestAnimationFrame(detectLoop);
+        };
+
+        return (
+          <div className={`absolute bottom-4 right-4 bg-black/80 rounded-lg overflow-hidden border border-white/20 shadow-2xl z-50 transition-all duration-300 ease-in-out ${isCollapsed ? 'w-10 h-10 flex items-center justify-center cursor-pointer' : 'w-32 h-24 sm:w-48 sm:h-36'}`}>
+            <button 
+              onClick={() => setIsCollapsed(!isCollapsed)} 
+              className={`absolute z-50 text-white/80 hover:text-white bg-black/40 rounded-full flex items-center justify-center transition-all ${isCollapsed ? 'inset-0 w-full h-full' : 'top-1 right-1 w-6 h-6'}`}
+              title={isCollapsed ? "Show Webcam" : "Hide Webcam"}
+            >
+               {isCollapsed ? '📷' : '▼'}
+            </button>
+            <div className={`relative w-full h-full transition-opacity duration-300 ${isCollapsed ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}>
+               <video ref={videoRef} autoPlay playsInline muted className="absolute inset-0 w-full h-full object-cover transform scale-x-[-1] opacity-50" />
+               <canvas ref={canvasRef} width={320} height={240} className="absolute inset-0 w-full h-full object-cover" />
+            </div>
+          </div>
+        );
+      };
+
+      // --- Component: Overlay ---
+      const Overlay = ({ onAddWish, onMusicToggle, onMusicUpload, mode, loading, config, setConfig }) => {
+        const [tipsOpen, setTipsOpen] = useState(false);
+        const [settingsOpen, setSettingsOpen] = useState(false);
+        const [wishInputOpen, setWishInputOpen] = useState(false);
+        const [wishText, setWishText] = useState("");
+        const [musicPlaying, setMusicPlaying] = useState(false);
+        
+        const fileInputRef = useRef(null);
+        const musicInputRef = useRef(null);
+
+        const handleFileChange = (e) => {
+          if (e.target.files && e.target.files.length > 0) {
+            Array.from(e.target.files).forEach(file => {
+                const type = file.type.startsWith('video') ? 'VIDEO' : 'PHOTO';
+                onAddWish(type, file);
+            });
+            e.target.value = ''; 
+          }
+        };
+
+        const handleMusicChange = (e) => {
+          if (e.target.files && e.target.files[0]) {
+              onMusicUpload(e.target.files[0]);
+              setMusicPlaying(true);
+          }
+        };
+
+        const toggleMusic = () => {
+          setMusicPlaying(!musicPlaying);
+          onMusicToggle(!musicPlaying);
+        };
+
+        const updateConfig = (key, value) => {
+            setConfig({ ...config, [key]: value });
+        };
+
+        const buttonClass = "bg-white/10 backdrop-blur-md border border-white/20 text-white px-4 py-2 rounded-full hover:bg-white/20 transition text-sm font-semibold shadow-lg flex items-center gap-2";
+
+        if (loading) return (
+          <div className="absolute inset-0 flex items-center justify-center bg-black z-[100] text-white flex-col">
+             <div className="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-red-600 mb-4"></div>
+             <h2 className="text-xl font-light tracking-widest text-gold-400">LOADING MAGIC...</h2>
+             <p className="text-sm text-gray-400 mt-2">Allow camera access to interact</p>
+          </div>
+        );
+
+        return (
+          <div className="absolute inset-0 pointer-events-none z-40">
+            <div className="absolute top-6 left-6 pointer-events-auto">
+              <h1 className="text-5xl md:text-7xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-red-600 via-yellow-300 to-green-600 drop-shadow-[0_2px_4px_rgba(0,0,0,0.8)] transform -rotate-2" style={{ fontFamily: '"Brush Script MT", cursive' }}>
+                Merry Christmas~
+              </h1>
+              <p className="text-blue-100 text-lg ml-2 mt-[-5px] tracking-widest font-serif italic opacity-90 drop-shadow-md">
+                ~ Where your wishes become stars ~
+              </p>
+            </div>
+
+            <div className="absolute top-6 right-6 flex flex-col gap-3 pointer-events-auto items-end">
+              <div className="flex gap-2">
+                  <button onClick={() => setWishInputOpen(true)} className={buttonClass}>
+                      <span>✨</span> Wishes
+                  </button>
+                  <button onClick={() => fileInputRef.current?.click()} className={buttonClass}>
+                      <span>📷</span> Photo/Video
+                  </button>
+              </div>
+
+              <div className="flex items-center bg-white/10 backdrop-blur-md border border-white/20 rounded-full shadow-lg overflow-hidden group">
+                  <button onClick={() => musicInputRef.current?.click()} className="px-4 py-2 text-white hover:bg-white/10 border-r border-white/20 transition text-sm font-medium flex items-center gap-2">
+                      <span>♫</span> Music
+                  </button>
+                  <button onClick={toggleMusic} className={`w-12 h-full py-2 flex items-center justify-center transition hover:bg-white/20 ${musicPlaying ? 'text-green-400' : 'text-white'}`} title={musicPlaying ? "Pause" : "Play"}>
+                      {musicPlaying ? (
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                      ) : (
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                      )}
+                  </button>
+              </div>
+            </div>
+
+            <div className="absolute bottom-6 left-6 flex flex-row items-end gap-3 pointer-events-auto">
+                <div className="flex flex-col gap-3 items-center">
+                  <div className="relative">
+                      {settingsOpen && (
+                        <div className="absolute bottom-14 left-0 w-64 bg-black/80 backdrop-blur-xl border border-white/20 rounded-xl p-4 shadow-2xl z-50">
+                            <h3 className="text-white text-sm font-bold mb-3 border-b border-white/10 pb-2">PARTICLE SETTINGS</h3>
+                            <div className="space-y-4">
+                                <div>
+                                    <div className="flex justify-between text-xs text-gray-300 mb-1">
+                                        <span>Count</span><span>{config.particleCount}</span>
+                                    </div>
+                                    <input type="range" min="500" max="3000" step="100" value={config.particleCount} onChange={(e) => updateConfig('particleCount', parseInt(e.target.value))} className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-red-500"/>
+                                </div>
+                                <div>
+                                    <div className="flex justify-between text-xs text-gray-300 mb-1">
+                                        <span>Size</span><span>{config.baseSize.toFixed(1)}x</span>
+                                    </div>
+                                    <input type="range" min="0.5" max="2.0" step="0.1" value={config.baseSize} onChange={(e) => updateConfig('baseSize', parseFloat(e.target.value))} className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-green-500"/>
+                                </div>
+                                <div>
+                                    <div className="flex justify-between text-xs text-gray-300 mb-1">
+                                        <span>Glow/Bloom</span><span>{config.bloomStrength.toFixed(1)}</span>
+                                    </div>
+                                    <input type="range" min="0" max="3.0" step="0.1" value={config.bloomStrength} onChange={(e) => updateConfig('bloomStrength', parseFloat(e.target.value))} className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-yellow-500"/>
+                                </div>
+                                <div>
+                                    <div className="flex justify-between text-xs text-gray-300 mb-1">
+                                        <span>Particle Emission</span><span>{config.particleGlow.toFixed(1)}</span>
+                                    </div>
+                                    <input type="range" min="0" max="5.0" step="0.2" value={config.particleGlow} onChange={(e) => updateConfig('particleGlow', parseFloat(e.target.value))} className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-orange-500"/>
+                                </div>
+                                <div>
+                                    <div className="flex justify-between text-xs text-gray-300 mb-1">
+                                        <span>Scatter Radius</span><span>{config.scatterRadius}</span>
+                                    </div>
+                                    <input type="range" min="10" max="100" step="5" value={config.scatterRadius} onChange={(e) => updateConfig('scatterRadius', parseInt(e.target.value))} className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-blue-500"/>
+                                </div>
+                                 <div>
+                                    <div className="flex justify-between text-xs text-gray-300 mb-1">
+                                        <span>Tree Bottom Gaps</span><span>{config.treeGapFactor.toFixed(1)}</span>
+                                    </div>
+                                    <input type="range" min="1.0" max="5.0" step="0.5" value={config.treeGapFactor} onChange={(e) => updateConfig('treeGapFactor', parseFloat(e.target.value))} className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-purple-500"/>
+                                </div>
+                            </div>
+                        </div>
+                      )}
+                      <button onClick={() => setSettingsOpen(!settingsOpen)} className={`w-12 h-12 rounded-full flex items-center justify-center border transition shadow-lg backdrop-blur-md text-xl ${settingsOpen ? 'bg-white/20 border-white/40 text-yellow-400' : 'bg-white/5 border-white/10 text-white hover:bg-white/10'}`}>⚙</button>
+                  </div>
+
+                  <div className="relative">
+                    {tipsOpen && (
+                         <div className="absolute bottom-14 left-0 w-56 bg-black/60 backdrop-blur-md border border-white/10 rounded-xl p-4 text-white text-xs shadow-xl z-50">
+                             <div className="flex justify-between items-center mb-2 border-b border-white/10 pb-1">
+                                 <span className="font-bold text-yellow-400">GESTURES</span>
+                                 <button onClick={() => setTipsOpen(false)} className="text-gray-400 hover:text-white">✕</button>
+                             </div>
+                             <ul className="space-y-2">
+                                 <li className="flex items-center gap-2"><span className="text-lg">✊</span> <span>Fist: <b>TREE</b> mode</span></li>
+                                 <li className="flex items-center gap-2"><span className="text-lg">🖐</span> <span>Open: <b>SCATTER</b> mode</span></li>
+                                 <li className="flex items-center gap-2"><span className="text-lg">👌</span> <span>Pinch: <b>FOCUS</b> mode</span></li>
+                             </ul>
+                             <p className="mt-2 text-gray-400 italic font-thin opacity-70">In Scatter mode, move hand to rotate view.</p>
+                         </div>
+                    )}
+                    <button onClick={() => setTipsOpen(!tipsOpen)} className={`w-12 h-12 rounded-full flex items-center justify-center border transition shadow-lg backdrop-blur-md text-lg font-serif italic ${tipsOpen ? 'bg-white/20 border-white/40 text-yellow-400' : 'bg-white/5 border-white/10 text-white hover:bg-white/10'}`}>?</button>
+                  </div>
+                </div>
+
+                <div className="h-12 flex items-center px-4 bg-black/60 backdrop-blur rounded-full border border-white/10 text-white/90 text-xs tracking-widest uppercase shadow-lg">
+                    MODE: <span className="text-yellow-400 font-bold ml-2 text-sm">{mode}</span>
+                </div>
+            </div>
+
+            <input type="file" ref={fileInputRef} className="hidden" accept="image/*,video/*" multiple onChange={handleFileChange} />
+            <input type="file" ref={musicInputRef} className="hidden" accept="audio/*" onChange={handleMusicChange} />
+
+            {wishInputOpen && (
+              <div className="absolute inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center pointer-events-auto z-50">
+                  <div className="bg-white/10 border border-white/20 p-6 rounded-xl w-80 shadow-2xl backdrop-blur-lg">
+                      <h3 className="text-white text-lg mb-4 font-semibold">Make a Wish</h3>
+                      <textarea 
+                          value={wishText}
+                          onChange={(e) => setWishText(e.target.value)}
+                          className="w-full h-32 bg-black/30 text-white p-3 rounded border border-white/10 focus:outline-none focus:border-yellow-400 resize-none"
+                          placeholder="Type your wish..."
+                      />
+                      <div className="flex justify-end gap-2 mt-4">
+                          <button onClick={() => setWishInputOpen(false)} className="px-4 py-1 text-gray-300 hover:text-white">Cancel</button>
+                          <button onClick={() => { if(wishText) onAddWish('TEXT', wishText); setWishText(""); setWishInputOpen(false); }} className="px-4 py-1 bg-red-600 rounded text-white hover:bg-red-500">Send</button>
+                      </div>
+                  </div>
+              </div>
+            )}
+          </div>
+        );
+      };
+
+      // --- Component: App ---
+      const createTextTexture = (text) => {
+          const canvas = document.createElement('canvas');
+          canvas.width = 512;
+          canvas.height = 300;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+              ctx.fillStyle = '#F5F5DC'; 
+              ctx.fillRect(0, 0, 512, 300);
+              
+              ctx.strokeStyle = '#B01010'; 
+              ctx.lineWidth = 15;
+              ctx.strokeRect(0, 0, 512, 300);
+              ctx.strokeStyle = '#FFFFFF';
+              ctx.lineWidth = 5;
+              ctx.strokeRect(10, 10, 492, 280);
+
+              ctx.fillStyle = '#104020'; 
+              ctx.font = 'bold 40px "Times New Roman", serif';
+              ctx.textAlign = 'center';
+              ctx.shadowColor = "rgba(0,0,0,0.1)";
+              ctx.shadowBlur = 2;
+              ctx.fillText("My Christmas Wish", 256, 60);
+              ctx.shadowBlur = 0;
+              
+              ctx.fillStyle = '#111111'; 
+              ctx.font = 'bold 32px Arial, sans-serif'; 
+              const words = text.split(' ');
+              let line = '';
+              let y = 120;
+              for (let n = 0; n < words.length; n++) {
+                  const testLine = line + words[n] + ' ';
+                  const metrics = ctx.measureText(testLine);
+                  const testWidth = metrics.width;
+                  if (testWidth > 450 && n > 0) {
+                      ctx.fillText(line, 256, y);
+                      line = words[n] + ' ';
+                      y += 40;
+                  } else {
+                      line = testLine;
+                  }
+              }
+              ctx.fillText(line, 256, y);
+          }
+          const tex = new THREE.CanvasTexture(canvas);
+          tex.colorSpace = THREE.SRGBColorSpace;
+          return tex;
+      };
+
+      const App = () => {
+        const [loading, setLoading] = useState(true);
+        const [mode, setMode] = useState(AppMode.TREE);
+        const [gesture, setGesture] = useState({ name: 'NONE', pinchDistance: 1, position: {x: 0.5, y: 0.5} });
+        const [wishes, setWishes] = useState([]);
+        
+        const [config, setConfig] = useState({
+            particleCount: PARTICLE_COUNT,
+            baseSize: 1.0,
+            bloomStrength: 1.5,
+            particleGlow: 1.0,
+            scatterRadius: 35,
+            treeGapFactor: 3.0
+        });
+
+        const audioRef = useRef(new Audio());
+
+        const handleGesture = (g) => {
+          setGesture(g);
+          
+          if (g.name === 'FIST') {
+              setMode(AppMode.TREE);
+          } else if (g.name === 'OPEN') {
+              setMode(AppMode.SCATTER);
+          } else if (g.name === 'PINCH' && mode !== AppMode.FOCUS) {
+              setMode(AppMode.FOCUS);
+          } else if (g.name !== 'PINCH' && mode === AppMode.FOCUS) {
+              setMode(AppMode.SCATTER);
+          } else if (g.name === 'NONE') {
+              setMode(AppMode.TREE);
+          }
+        };
+
+        const addWish = async (type, content) => {
+          const id = Date.now().toString();
+          let texture;
+          let aspectRatio = 1;
+
+          if (type === 'TEXT') {
+              texture = createTextTexture(content);
+              aspectRatio = 1.7;
+          } else if (type === 'PHOTO' && content instanceof File) {
+              const url = URL.createObjectURL(content);
+              const img = new Image();
+              img.src = url;
+              await new Promise((resolve) => { img.onload = resolve; });
+              texture = new THREE.TextureLoader().load(url);
+              texture.colorSpace = THREE.SRGBColorSpace; 
+              aspectRatio = img.width / img.height;
+          } else if (type === 'VIDEO' && content instanceof File) {
+              const url = URL.createObjectURL(content);
+              const video = document.createElement('video');
+              video.src = url;
+              video.crossOrigin = "anonymous";
+              video.loop = true;
+              video.muted = true;
+              video.playsInline = true;
+              
+              await new Promise((resolve) => { video.onloadedmetadata = resolve; });
+              aspectRatio = video.videoWidth / video.videoHeight;
+              texture = new THREE.VideoTexture(video);
+              texture.colorSpace = THREE.SRGBColorSpace;
+          }
+
+          if (texture) {
+              setWishes(prev => [...prev, { id, type, content: type === 'TEXT' ? content : '', texture, aspectRatio }]);
+          }
+        };
+
+        const toggleMusic = (play) => {
+          if (play) {
+              audioRef.current.play().catch(e => {
+                  alert("Please interact with the page first to play audio.");
+              });
+          } else {
+              audioRef.current.pause();
+          }
+        };
+
+        const uploadMusic = (file) => {
+          const url = URL.createObjectURL(file);
+          audioRef.current.src = url;
+          audioRef.current.loop = true;
+          audioRef.current.play();
+        };
+
+        return (
+          <div className="relative w-full h-screen bg-[#000510] overflow-hidden select-none font-sans">
+            <Scene 
+              mode={mode} 
+              gesture={gesture} 
+              wishes={wishes} 
+              setMode={setMode}
+              config={config}
+              onFocusItem={() => {}}
+            />
+            
+            <Overlay 
+              mode={mode}
+              loading={loading}
+              config={config}
+              setConfig={setConfig}
+              onAddWish={addWish}
+              onMusicToggle={toggleMusic}
+              onMusicUpload={uploadMusic}
+            />
+
+            <WebcamInput 
+              onGesture={handleGesture} 
+              onLoaded={() => setLoading(false)} 
+            />
+          </div>
+        );
+      };
+
+      const root = ReactDOM.createRoot(document.getElementById('root'));
+      root.render(<App />);
+    </script>
   </body>
 </html>
