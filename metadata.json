@@ -1,0 +1,7 @@
+{
+  "name": "Christmas Magic Wishes",
+  "description": "A 3D interactive Christmas particle experience controlled by hand gestures using MediaPipe and Three.js.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
